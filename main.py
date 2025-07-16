@@ -1,15 +1,12 @@
 """
-Database Application with Table Management and Text2SQL Integration
+Database Application with Table Management and NLSQLTableQueryEngine Integration
 """
 
 import streamlit as st
 import pandas as pd
-import psycopg2
 from sqlalchemy import create_engine, text, inspect
-from sqlalchemy.types import String, Integer, Float, DateTime, Boolean
-import io
-import sys
 import os
+os.environ["OPENAI_API_KEY"] = st.secrets["openai"]["api_key"]
 from urllib.parse import quote_plus
 import re
 import json
@@ -17,7 +14,10 @@ from griptape.rules import Rule
 from griptape.structures import Pipeline
 from griptape.tasks import PromptTask
 
-from text2sql_pipeline import Text2SQLPipeline
+# LlamaIndex imports for SQL query engine
+from llama_index.llms.azure_openai import AzureOpenAI
+from llama_index.core import SQLDatabase, Settings
+from llama_index.core.query_engine import NLSQLTableQueryEngine
 
 class DatabaseManager:
     """Manage database connections and operations."""
@@ -30,13 +30,6 @@ class DatabaseManager:
     def translate_column_names(self, japanese_columns: list) -> dict:
         """Translate Japanese column names to English using Griptape AI."""
         try:
-            # Set OpenAI API key for Griptape from secrets
-            import os
-            try:
-                os.environ["OPENAI_API_KEY"] = st.secrets["griptape"]["openai_api_key"]
-            except KeyError:
-                st.warning("Griptape OpenAI API key not found in secrets, using default configuration")
-            
             # Create the prompt with all column names
             columns_text = ", ".join([f'"{col}"' for col in japanese_columns])
             
@@ -238,13 +231,19 @@ class DatabaseManager:
             st.error(f"Error executing query: {str(e)}")
             return pd.DataFrame()
 
-class EnhancedText2SQLPipeline(Text2SQLPipeline):
-    """Enhanced Text2SQL Pipeline with dynamic table selection."""
+class SQLQueryEngine:
+    """Enhanced SQL Query Engine using NLSQLTableQueryEngine."""
     
-    def __init__(self, db_manager: DatabaseManager, selected_table: str = None):
-        # Don't call super().__init__() to avoid the default database connection
-        
-        # Configuration from secrets
+    def __init__(self, db_manager: DatabaseManager, selected_tables: list = None):
+        self.db_manager = db_manager
+        self.selected_tables = selected_tables
+        self.llm = None
+        self.sql_engine = None
+        self._setup_llm()
+        self._setup_sql_engine()
+    
+    def _setup_llm(self):
+        """Setup the LLM from secrets."""
         try:
             api_key = st.secrets["openai"]["api_key"]
             azure_endpoint = st.secrets["openai"]["azure_endpoint"]
@@ -252,9 +251,6 @@ class EnhancedText2SQLPipeline(Text2SQLPipeline):
         except KeyError as e:
             st.error(f"❌ Missing OpenAI secret key: {e}")
             raise Exception(f"Missing OpenAI configuration in secrets: {e}")
-
-        from llama_index.llms.azure_openai import AzureOpenAI
-        from llama_index.core import Settings
 
         # Initialize LLM
         self.llm = AzureOpenAI(
@@ -267,109 +263,79 @@ class EnhancedText2SQLPipeline(Text2SQLPipeline):
 
         # Set global settings
         Settings.llm = self.llm
-
-        # Use the provided database manager
-        self.db_manager = db_manager
-        self.engine = db_manager.engine
-        self.selected_table = selected_table
-        
-        # Get schema info for selected table
-        if selected_table:
-            self.schema_info = self._get_schema_info_for_table(selected_table)
-        else:
-            self.schema_info = self._get_all_schema_info()
     
-    def _get_schema_info_for_table(self, table_name: str) -> str:
-        """Get schema information for a specific table."""
+    def _setup_sql_engine(self):
+        """Setup the SQL database and query engine."""
         try:
-            columns = self.db_manager.get_table_info(table_name)
-            schema_text = f"Table: {table_name}\nColumns:\n"
-            for col in columns:
-                schema_text += f"- {col['name']} ({col['type']})\n"
-            return schema_text
+            # Determine which tables to include
+            if self.selected_tables:
+                include_tables = self.selected_tables
+            else:
+                # Include all tables if none specified
+                include_tables = self.db_manager.get_tables()
+            
+            # Create SQLDatabase
+            sql_db = SQLDatabase(self.db_manager.engine, include_tables=include_tables)
+            
+            # Create SQL query engine with enhanced prompting
+            self.sql_engine = NLSQLTableQueryEngine(
+                sql_database=sql_db,
+                verbose=True,
+            )
+            
+            st.success(f"✅ SQL Query Engine initialized with tables: {', '.join(include_tables)}")
+            
         except Exception as e:
-            return f"Error getting schema for {table_name}: {str(e)}"
+            st.error(f"❌ Error setting up SQL engine: {str(e)}")
+            raise
     
-    def _get_all_schema_info(self) -> str:
-        """Get schema information for all tables."""
+    def query(self, question: str):
+        """Query using the NLSQLTableQueryEngine."""
+        if not self.sql_engine:
+            raise Exception("SQL engine not initialized")
+        
         try:
-            tables = self.db_manager.get_tables()
-            schema_text = "Available Tables:\n"
-            for table in tables:
-                columns = self.db_manager.get_table_info(table)
-                schema_text += f"\nTable: {table}\nColumns:\n"
-                for col in columns:
-                    schema_text += f"- {col['name']} ({col['type']})\n"
-            return schema_text
+            st.info(f"🤔 Processing question: {question}")
+            
+            # Execute the query
+            response = self.sql_engine.query(question)
+            
+            # Extract information from response
+            result = {
+                "question": question,
+                "sql_query": response.metadata.get('sql_query', 'N/A'),
+                "final_answer": str(response),
+                "response_object": response
+            }
+            
+            return result
+            
         except Exception as e:
-            return f"Error getting schema info: {str(e)}"
-    
-    def natural_language_to_sql(self, question: str) -> str:
-        """Convert natural language question to SQL query."""
-        
-        table_context = ""
-        if self.selected_table:
-            table_context = f"Focus on the table: {self.selected_table}\n"
-        
-        prompt = f"""
-        You are an expert SQL query generator. Given a natural language question, generate a PostgreSQL query.
-
-        Database Schema:
-        {self.schema_info}
-
-        {table_context}
-        Question: {question}
-
-        Instructions:
-        - Generate only the SQL query, no explanation
-        - Use proper PostgreSQL syntax
-        - Return only the SELECT statement
-        - For Japanese text, use appropriate filtering
-        - Use the public schema
-
-        SQL Query:
-        """
-        
-        response = self.llm.complete(prompt)
-        sql_query = response.text.strip()
-        
-        # Clean up the SQL query (remove any markdown formatting)
-        if sql_query.startswith("```sql"):
-            sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
-        elif sql_query.startswith("```"):
-            sql_query = sql_query.replace("```", "").strip()
-        
-        return sql_query
+            st.error(f"❌ Error processing query: {str(e)}")
+            raise
 
 def main():
     """Main Streamlit application."""
     
     st.set_page_config(
-        page_title="Database Management & Text2SQL",
+        page_title="Database Management & SQL Query Engine",
         page_icon="🗄️",
         layout="wide"
     )
     
-    st.title("🗄️ Database Management & Text2SQL Pipeline")
-    st.markdown("Connect to your database, manage tables, upload Excel files, and query with natural language!")
+    st.title("🗄️ Database Management & SQL Query Engine")
+    st.markdown("Connect to your database, manage tables, upload Excel files, and query with natural language using LlamaIndex!")
     
     # Initialize session state
     if 'db_manager' not in st.session_state:
         st.session_state.db_manager = None
-    if 'selected_table' not in st.session_state:
-        st.session_state.selected_table = None
+    if 'selected_tables' not in st.session_state:
+        st.session_state.selected_tables = []
     
-    # Sidebar for database connection
-    with st.sidebar:
-        st.header("🔌 Database Connection")
-        
-        # Database connection info
-        st.info("📡 Uses IPv4-compatible Supabase session pooler for better connectivity")
-        st.info("🔐 Database credentials are loaded from Streamlit secrets")
-        
-        # Connect button (password comes from secrets)
-        if st.button("Connect to Database"):
-            try:
+    # Auto-connect to database on startup
+    if st.session_state.db_manager is None:
+        try:
+            with st.spinner("🔌 Connecting to database..."):
                 # Get database password from secrets
                 db_password = st.secrets["database"]["password"]
                 
@@ -380,23 +346,19 @@ def main():
                 
                 st.session_state.db_manager = DatabaseManager(connection_string)
                 
-            except KeyError as e:
-                st.error(f"❌ Missing secret key: {e}")
-                st.error("Please configure database password in Streamlit secrets")
-            except Exception as e:
-                st.error(f"❌ Connection error: {e}")
-        
-        # Show connection status
-        if st.session_state.db_manager:
-            st.success("🟢 Connected")
-        else:
-            st.warning("🔴 Not Connected")
+        except KeyError as e:
+            st.error(f"❌ Missing secret key: {e}")
+            st.error("Please configure database password in Streamlit secrets")
+            st.stop()
+        except Exception as e:
+            st.error(f"❌ Connection error: {e}")
+            st.stop()
     
     # Main content
     if st.session_state.db_manager:
         
         # Create tabs
-        tab1, tab2, tab3 = st.tabs(["📊 Table Management", "📤 Upload Excel", "🤖 Text2SQL Query"])
+        tab1, tab2, tab3 = st.tabs(["📊 Table Management", "📤 Upload Excel", "🤖 SQL Query Engine"])
         
         with tab1:
             st.header("📊 Table Management")
@@ -412,8 +374,6 @@ def main():
                     selected_table = st.selectbox("Select a table:", [""] + tables)
                     
                     if selected_table:
-                        st.session_state.selected_table = selected_table
-                        
                         # Show table info
                         st.subheader("Table Information")
                         table_info = st.session_state.db_manager.get_table_info(selected_table)
@@ -490,63 +450,140 @@ def main():
                     st.error(f"Error reading Excel file: {str(e)}")
         
         with tab3:
-            st.header("🤖 Text2SQL Query")
+            st.header("🤖 SQL Query Engine")
+            st.markdown("Powered by LlamaIndex NLSQLTableQueryEngine")
             
             # Table selection for queries
             tables = st.session_state.db_manager.get_tables()
-            query_table = st.selectbox(
-                "Select table for queries (optional - leave empty for all tables):", 
-                [""] + tables,
-                key="query_table"
-            )
             
-            # Initialize Text2SQL pipeline
-            if 'text2sql_pipeline' not in st.session_state or st.session_state.get('query_table_changed'):
-                st.session_state.text2sql_pipeline = EnhancedText2SQLPipeline(
-                    st.session_state.db_manager, 
-                    query_table if query_table else None
+            if tables:
+                # Simple table selection
+                st.subheader("📋 Table Selection")
+                col1, col2 = st.columns([2, 1])
+                with col1:
+                    selected_tables = st.multiselect(
+                        "Select tables for querying:", 
+                        tables,
+                        default=[],
+                        key="query_tables",
+                        help="Select specific tables or leave empty to use all tables"
+                    )
+                
+                with col2:
+                    use_all_tables = st.button("🔄 Use All Tables")
+                    if use_all_tables:
+                        st.session_state.query_tables = []
+                        st.session_state.use_all_tables_clicked = True
+                        st.rerun()
+                
+                # Check if table selection changed
+                if st.session_state.get('last_selected_tables') != selected_tables:
+                    st.session_state.last_selected_tables = selected_tables
+                    # Clear the existing engine when tables change
+                    if 'sql_query_engine' in st.session_state:
+                        del st.session_state.sql_query_engine
+                
+                # Determine if user has made a choice
+                user_made_choice = (
+                    selected_tables or 
+                    st.session_state.get('use_all_tables_clicked', False)
                 )
-                st.session_state.query_table_changed = False
-            
-            # Check if table selection changed
-            if st.session_state.get('last_query_table') != query_table:
-                st.session_state.last_query_table = query_table
-                st.session_state.query_table_changed = True
-                st.rerun()
-            
-            # Query interface
-            question = st.text_area("Enter your question in natural language:", 
-                                   placeholder="例: KICで発生したトラブルの件数を教えてください。")
-            
-            if st.button("🔍 Query"):
-                if question:
-                    with st.spinner("Generating SQL and executing query..."):
+                
+                if user_made_choice:
+                    # Show current selection and initialize engine
+                    if selected_tables:
+                        st.info(f"🎯 **Selected tables**: {', '.join(selected_tables)}")
+                        tables_to_use = selected_tables
+                    else:
+                        st.info(f"🌐 **Using all tables**: {', '.join(tables)}")
+                        tables_to_use = None
+                    
+                    # Initialize engine if not exists
+                    if 'sql_query_engine' not in st.session_state:
                         try:
-                            result = st.session_state.text2sql_pipeline.query(question)
-                            
-                            # Display results
-                            st.subheader("🤔 Your Question")
-                            st.write(result["question"])
-                            
-                            st.subheader("🔍 Generated SQL")
-                            st.code(result["sql_query"], language="sql")
-                            
-                            st.subheader("📊 Query Results")
-                            if not result["sql_results"].empty:
-                                st.dataframe(result["sql_results"], hide_index=True)
-                            else:
-                                st.info("No results found.")
-                            
-                            st.subheader("🧠 AI Response")
-                            st.write(result["final_answer"])
-                            
+                            with st.spinner("🔧 Initializing SQL Query Engine..."):
+                                st.session_state.sql_query_engine = SQLQueryEngine(
+                                    st.session_state.db_manager, 
+                                    tables_to_use
+                                )
+                            st.success("✅ Query Engine ready!")
                         except Exception as e:
-                            st.error(f"Error processing query: {str(e)}")
+                            st.error(f"❌ Error initializing SQL Query Engine: {str(e)}")
+                            st.error("Please check your OpenAI configuration in secrets.")
+                            st.stop()
+                    
+                    # Query interface
+                    st.divider()
+                    st.subheader("💬 Ask Your Question")
+                    
+                    question = st.text_area(
+                        "Enter your question in natural language:", 
+                        placeholder="例: KICで発生したトラブルの件数を教えてください。\nExample: How many trouble reports are there from KIC?",
+                        height=100,
+                        key="question_input"
+                    )
+                    
+                    # Use form to prevent premature rerendering
+                    with st.form("query_form"):
+                        submit_button = st.form_submit_button("🔍 Execute Query", type="primary")
+                    
+                    if submit_button and question.strip():
+                        with st.spinner("🤔 Processing your question..."):
+                            try:
+                                result = st.session_state.sql_query_engine.query(question)
+                                
+                                # Display results
+                                st.success("✅ Query executed successfully!")
+                                
+                                # Create tabs for results
+                                result_tab1, result_tab2 = st.tabs(["📊 Answer & SQL", "🔍 Details"])
+                                
+                                with result_tab1:
+                                    col1, col2 = st.columns([1, 1])
+                                    
+                                    with col1:
+                                        st.subheader("🧠 AI Answer")
+                                        st.write(result["final_answer"])
+                                    
+                                    with col2:
+                                        st.subheader("🔍 Generated SQL")
+                                        st.code(result["sql_query"], language="sql")
+                                
+                                with result_tab2:
+                                    st.subheader("❓ Your Question")
+                                    st.write(result["question"])
+                                    
+                                    # Additional metadata if available
+                                    if hasattr(result["response_object"], 'source_nodes'):
+                                        st.subheader("📚 Source Information")
+                                        for i, node in enumerate(result["response_object"].source_nodes):
+                                            with st.expander(f"Source {i+1}"):
+                                                st.write(node.text)
+                            
+                            except Exception as e:
+                                st.error(f"❌ Error processing query: {str(e)}")
+                                st.error("Please check your question and try again.")
+                    
+                    # Show help
+                    with st.expander("💡 Query Tips"):
+                        st.markdown("""
+                        **Example questions you can ask:**
+                        - How many records are in the table?
+                        - What are the unique values in column X?
+                        - Show me the top 10 entries by date
+                        - Count records where condition Y is true
+                        - What's the average/sum/max of column Z?
+                        """)
                 else:
-                    st.warning("Please enter a question.")
+                    st.info("📝 **Please select tables first to enable the query interface.**")
+                    st.markdown("Choose specific tables from the dropdown above, or click 'Use All Tables' to proceed.")
+                
+            else:
+                st.info("📋 No tables found in the database. Please upload some data first.")
     
     else:
-        st.info("👈 Please connect to the database using the sidebar.")
+        st.error("❌ Failed to connect to database. Please check your configuration.")
+        st.stop()
 
 if __name__ == "__main__":
     main() 
