@@ -17,9 +17,8 @@ from griptape.rules import Rule
 from griptape.structures import Pipeline
 from griptape.tasks import PromptTask
 
-
-# Add the parent directory to the path to import the Text2SQL pipeline
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
+# Add current directory to Python path for imports
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from text2sql_pipeline import Text2SQLPipeline
 
 class DatabaseManager:
