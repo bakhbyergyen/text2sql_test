@@ -1,0 +1,8 @@
+streamlit
+pandas
+sqlalchemy
+openpyxl
+griptape[drivers-sql]
+psycopg2-binary
+llama-index-core
+llama-index-llms-azure-openai 
